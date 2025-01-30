@@ -1,125 +1,123 @@
-import json
-import requests
-import gc
+import os
+import asyncio
+import aiohttp
 import pandas as pd
-from textblob import TextBlob
+import numpy as np
+import torch
+from sklearn.decomposition import PCA
+from statsmodels.tsa.stattools import coint, adfuller
+from transformers import BertTokenizer, BertForSequenceClassification
+from scipy.stats import zscore
+from dotenv import load_dotenv
 
-# Load the configuration file that contains API keys and other settings
-with open('config/config.json') as f:
-    config = json.load(f)
+load_dotenv()
 
-# Function to fetch news headlines using NewsAPI
-def fetch_news(api: str, query: str, page=1) -> list:
-    # Construct the API URL with the given query and page number
-    url = f"https://newsapi.org/v2/everything?q={query}&page={page}&apiKey={api}"
-    response = requests.get(url)
-    
-    # Extract the headlines from the API response
-    articles = response.json().get("articles", [])
-    headlines = [article["title"] for article in articles if "title" in article]
-    return headlines
+class QuantTradingSystem:
+    def __init__(self):
+        self.news_api_key = os.getenv("NEWS_API_KEY")
+        self.alpha_vantage_key = os.getenv("ALPHA_VANTAGE_API_KEY")
+        self.sentiment_model, self.tokenizer = self.load_sentiment_model()
 
-# Function to fetch daily stock data from Alpha Vantage API
-def get_stock_data(symbol: str, api_key: str):
-    endpoint = "https://www.alphavantage.co/query"
+    @staticmethod
+    def load_sentiment_model():
+        # FinBERT model for sentiment analysis
+        tokenizer = BertTokenizer.from_pretrained("yiyanghkust/finbert-tone")
+        model = BertForSequenceClassification.from_pretrained("yiyanghkust/finbert-tone")
+        return model, tokenizer
 
-    params = {
-        'function': 'TIME_SERIES_DAILY',
-        'symbol': symbol,
-        'outputsize': 'full',
-        'datatype': 'json',
-        'apikey': api_key
-    }
+    async def fetch_news(self, session, query):
+        # Asynchronously fetch news
+        url = f"https://newsapi.org/v2/everything?q={query}&apiKey={self.news_api_key}"
+        async with session.get(url) as response:
+            data = await response.json()
+            return [article["title"] for article in data.get("articles", [])]
 
-    response = requests.get(endpoint, params)
-
-    # Process the response if successful and return a DataFrame
-    if response.status_code == 200:
-        data = response.json()
-        if 'Time Series (Daily)' in data:
-            time_series = data['Time Series (Daily)']
-            pandasDf = pd.DataFrame.from_dict(time_series, orient='index')
-            pandasDf.index = pd.to_datetime(pandasDf.index)  # Convert index to datetime
-            pandasDf = pandasDf[['4. close']]  # Keep only the closing price
-            pandasDf.rename(columns={'4. close': 'Close'}, inplace=True)
-            return pandasDf
-    else:
+    async def get_stock_data(self, session, symbol):
+        # Asynchronously fetch stock data
+        url = f"https://www.alphavantage.co/query"
+        params = {
+            "function": "TIME_SERIES_DAILY",
+            "symbol": symbol,
+            "outputsize": "full",
+            "datatype": "json",
+            "apikey": self.alpha_vantage_key,
+        }
+        async with session.get(url, params=params) as response:
+            data = await response.json()
+            if "Time Series (Daily)" in data:
+                df = pd.DataFrame.from_dict(data["Time Series (Daily)"], orient="index")
+                df.index = pd.to_datetime(df.index)
+                df = df[["4. close"]].astype(float)
+                df.rename(columns={"4. close": symbol}, inplace=True)
+                return df
         return None
 
-# Function to analyze sentiment of news headlines using TextBlob
-def analyze_sentiment(headlines: list) -> pd.Series:
-    sentiments = []
+    def analyze_sentiment(self, headlines):
+        # Analyze sentimentt
+        inputs = self.tokenizer(headlines, padding=True, truncation=True, return_tensors="pt")
 
-    # Compute the sentiment polarity for each headline
-    for headline in headlines:
-        sentiment_score = TextBlob(headline).sentiment.polarity
-        sentiments.append(sentiment_score)
+        with torch.no_grad():
+            outputs = self.sentiment_model(**inputs)
+        scores = torch.nn.functional.softmax(outputs.logits, dim=-1)
+        sentiment_score = (scores[:, 2] - scores[:, 0]).mean().item()
+        return sentiment_score
 
-    # Return the mean sentiment score
-    return pd.Series(sentiments).mean()
+    def cointegration_test(self, x, y):
+        # Johansen cointegration test (needs to have p-value < 0.05)!!!
+        score, p_value, _ = coint(x, y)
+        return p_value
 
-# Function to generate basic trading signals based on z-score
-def generate_signals(data: pd.DataFrame, z_threshold=1.5) -> pd.DataFrame:
-    # Initialize signals column
-    data['signal'] = 0
+    def adf_test(self, series):
+        # Stationarity test (needs to have p-value < 0.05)!!!
+        result = adfuller(series)
+        return result[1]
 
-    # Generate signals based on z-score thresholds
-    data.loc[data['zscore'] > z_threshold, 'signal'] = -1  # Short spread
-    data.loc[data['zscore'] < -z_threshold, 'signal'] = 1  # Long spread
-    data.loc[data['zscore'].abs() < 0.5, 'signal'] = 0  # No significant deviation
+    def pca_factor_analysis(self, data):
+        # Principal Component Analysis to extract factors from stock data
+        pca = PCA(n_components=1)
+        principal_component = pca.fit_transform(data)
+        return pd.Series(principal_component.flatten(), index=data.index)
 
-    return data
+    async def run(self):
+        async with aiohttp.ClientSession() as session:
+            news_tsla, news_nio, data_tsla, data_nio = await asyncio.gather(
+                self.fetch_news(session, "TSLA"),
+                self.fetch_news(session, "NIO"),
+                self.get_stock_data(session, "TSLA"),
+                self.get_stock_data(session, "NIO"),
+            )
 
-# Function to calculate the sentiment spread between two assets
-def calculate_sentiment_spread(sentiment1, sentiment2):
-    return sentiment1 - sentiment2
+        # Sentiment analysis
+        score_tsla = self.analyze_sentiment(news_tsla)
+        score_nio = self.analyze_sentiment(news_nio)
 
-# Function to merge stock data and sentiment score into a hybrid signal
-def merge_signals(stock_data: pd.DataFrame, sentiment_score: float) -> pd.DataFrame:
-    # Add sentiment score to the DataFrame
-    stock_data['Sentiment'] = sentiment_score
+        # Merge stock data
+        data = data_tsla.join(data_nio, how="inner")
+        data["spread"] = data["TSLA"] - data["NIO"]
 
-    # Combine signal and sentiment into a hybrid signal
-    stock_data['Hybrid_Signal'] = 0.5 * stock_data['signal'] + 0.5 * sentiment_score
-    return stock_data
+        # Statistical validation
+        cointegration_p = self.cointegration_test(data["TSLA"], data["NIO"])
+        adf_p = self.adf_test(data["spread"])
+        print(f"Cointegration: {cointegration_p:.5f} | ADF: {adf_p:.5f}")
 
-# Main script execution
-if __name__ == '__main__':
-    # Fetch news headlines and analyze sentiment for TSLA
-    headlinesTSLA = fetch_news(config['NEWS_API_KEY'], 'TSLA')
-    scoreTSLA = analyze_sentiment(headlinesTSLA)
-    
-    # Fetch news headlines and analyze sentiment for NIO
-    headlinesNIO = fetch_news(config['NEWS_API_KEY'], 'NIO')
-    scoreNIO = analyze_sentiment(headlinesNIO)
+        if cointegration_p < 0.05 and adf_p < 0.05:
+            print("Valid pair for mean-reversion trading.")
+        else:
+            print("No strong statistical evidene for mean-reversion")
 
-    # Fetch stock data for TSLA and NIO
-    dataTSLA = get_stock_data('TSLA', config['ALPHA_VANTAGE_API_KEY'])
-    dataNIO = get_stock_data('NIO', config['ALPHA_VANTAGE_API_KEY'])
+        # PCA Factor Extraction
+        data["factor"] = self.pca_factor_analysis(data[["TSLA", "NIO"]])
 
-    # Rename and combine the stock data for both assets
-    dataTSLA.rename(columns={'Close': 'CloseTSLA'}, inplace=True)
-    dataTSLA['CloseNIO'] = dataNIO['Close']
+        # Generate Z-score and trading signals
+        data["zscore"] = zscore(data["spread"])
+        data["signal"] = np.where(data["zscore"] > 1.5, -1, 0)  # Short
+        data["signal"] = np.where(data["zscore"] < -1.5, 1, data["signal"])  # Long
 
-    # Prepare the final DataFrame for analysis
-    finalData = dataTSLA
-    del dataTSLA, dataNIO  # Free up memory
-    finalData = finalData.iloc[:7]  # Consider the last 7 rows
-    gc.collect()
+        # Save for backtesting
+        data[["TSLA", "NIO", "spread", "zscore", "signal", "factor"]].to_csv("../data/signals.csv")
 
-    # Ensure close values are numeric
-    finalData['CloseTSLA'] = pd.to_numeric(finalData['CloseTSLA'], errors='coerce')
-    finalData['CloseNIO'] = pd.to_numeric(finalData['CloseNIO'], errors='coerce')
+        print("Statistical validation + signals saved.")
 
-    # Calculate spread and z-score
-    finalData['spread'] = finalData['CloseTSLA'] - finalData['CloseNIO']
-    finalData['zscore'] = (finalData['spread'] - finalData['spread'].mean()) / finalData['spread'].std()
-
-    # Generate trading signals based on z-score
-    data = generate_signals(finalData)
-
-    # Merge signals with sentiment spread to generate hybrid signals
-    hybridSignal = merge_signals(data, calculate_sentiment_spread(scoreTSLA, scoreNIO))
-
-    # Print the rounded hybrid signal for the most recent date
-    print(round(hybridSignal['Hybrid_Signal'].iloc[0]))
+if __name__ == "__main__":
+    trading_system = QuantTradingSystem()
+    asyncio.run(trading_system.run())
